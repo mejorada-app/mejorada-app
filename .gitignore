@@ -1,0 +1,15 @@
+# Dependencias
+node_modules/
+
+# Base de datos local (se genera sola al arrancar el servidor)
+mejorada.db
+mejorada.db-journal
+mejorada.db-wal
+mejorada.db-shm
+
+# Logs
+*.log
+npm-debug.log*
+
+# Variables de entorno (contienen la API key — NUNCA subir)
+.env
