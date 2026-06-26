@@ -227,6 +227,7 @@
 
   <div class="nav">
     <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
+    <div class="nav-item" onclick="showPage('leads')">👥 Leads</div>
     <div class="nav-item" onclick="showPage('cotizaciones')">📋 Cotizaciones</div>
     <div class="nav-item" onclick="showPage('facturas')">🧾 Facturas</div>
     <div class="nav-item" onclick="showPage('gastos')">💸 Gastos</div>
@@ -247,6 +248,33 @@
         <div class="section">
           <div class="section-header"><span class="section-title">🧾 Últimas Facturas</span></div>
           <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Total</th><th>Pago</th></tr></thead><tbody id="dashFact"></tbody></table></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LEADS -->
+    <div class="page" id="page-leads">
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">👥 Leads (WhatsApp / IA)</span>
+          <button class="btn btn-outline" onclick="renderLeads()">↻ Actualizar</button>
+        </div>
+        <div class="filters">
+          <input type="text" placeholder="Buscar nombre / empresa / producto..." id="filterLeadTxt" oninput="renderLeads()">
+          <select id="filterLeadEstado" onchange="renderLeads()">
+            <option value="">Todos los estados</option>
+            <option value="nuevo">Nuevo</option>
+            <option value="contactado">Contactado</option>
+            <option value="cotizado">Cotizado</option>
+            <option value="ganado">Ganado</option>
+            <option value="perdido">Perdido</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Fecha</th><th>Nombre</th><th>Contacto</th><th>Empresa</th><th>Tipo</th><th>Presupuesto</th><th>Temp.</th><th>Producto / Notas</th><th>Estado</th><th>Acciones</th></tr></thead>
+            <tbody id="tablaLeads"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -475,7 +503,7 @@
 
 <script>
 let currentUser = null;
-let DB = { users:{}, cotizaciones:[], facturas:[], config:{} };
+let DB = { users:{}, cotizaciones:[], facturas:[], leads:[], config:{} };
 
 // ===================== API =====================
 async function api(method, path, body) {
@@ -487,15 +515,17 @@ async function api(method, path, body) {
 }
 
 async function loadDB() {
-  const [users, cotizaciones, facturas, config] = await Promise.all([
+  const [users, cotizaciones, facturas, leads, config] = await Promise.all([
     api('GET','/users'),
     api('GET','/cotizaciones'),
     api('GET','/facturas'),
+    api('GET','/leads'),
     api('GET','/config')
   ]);
   DB.users = users;
   DB.cotizaciones = cotizaciones;
   DB.facturas = facturas;
+  DB.leads = leads;
   DB.config = config;
 }
 
@@ -685,6 +715,7 @@ function showPage(name) {
   });
   if(name==='dashboard')    renderDashboard();
   if(name==='cotizaciones') renderCotizaciones();
+  if(name==='leads')        renderLeads();
   if(name==='facturas')     renderFacturas();
   if(name==='gastos')       renderGastos();
   if(name==='comisiones')   renderComisiones();
@@ -1082,6 +1113,61 @@ function fillFacturaFromData(d){
   factImportMsg(`✅ Leído desde <strong>${d._source}</strong>. Autocompletado: <strong>${set.join(', ')}</strong>.`
     + (missing.length?` <span style="color:#b9770e">Revisa a mano: ${missing.join(', ')}.</span>`:'')
     + extra, 'success');
+}
+
+// ===================== LEADS =====================
+function escLead(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function leadTemp(l){
+  const t=(l.temperatura||'')+' '+(l.producto||'');
+  if(/caliente/i.test(t)) return ['🔥 Caliente','#e74c3c'];
+  if(/tibio/i.test(t))    return ['🌤 Tibio','#f39c12'];
+  if(/fr[ií]o/i.test(t))  return ['❄ Frío','#3498db'];
+  return ['—','#7f8c8d'];
+}
+function renderLeads(){
+  const tbody=document.getElementById('tablaLeads');
+  const fT=(document.getElementById('filterLeadTxt').value||'').toLowerCase();
+  const fE=document.getElementById('filterLeadEstado').value;
+  const list=(DB.leads||[]).filter(l=>{
+    if(fE && (l.estado||'nuevo')!==fE) return false;
+    if(fT){
+      const blob=((l.nombre||'')+' '+(l.empresa||'')+' '+(l.producto||'')+' '+(l.correo||'')+' '+(l.telefono||'')).toLowerCase();
+      if(!blob.includes(fT)) return false;
+    }
+    return true;
+  });
+  if(!list.length){ tbody.innerHTML=`<tr><td colspan="10"><div class="empty-state"><div class="icon">👥</div><p>No hay leads todavía. Llegan automáticamente desde WhatsApp.</p></div></td></tr>`; return; }
+  const estados=['nuevo','contactado','cotizado','ganado','perdido'];
+  tbody.innerHTML=list.map(l=>{
+    const [tLabel,tColor]=leadTemp(l);
+    const fecha=(l.createdAt||'').slice(0,10)||'—';
+    const contacto=[l.telefono,l.correo].filter(Boolean).map(escLead).join('<br>')||'—';
+    const estadoSel=`<select onchange="setLeadEstado('${l.id}', this.value)" style="padding:4px 6px;border-radius:6px;border:1px solid #ddd">`
+      + estados.map(e=>`<option value="${e}" ${(l.estado||'nuevo')===e?'selected':''}>${e.charAt(0).toUpperCase()+e.slice(1)}</option>`).join('')
+      + `</select>`;
+    return `<tr>
+      <td style="white-space:nowrap">${fecha}</td>
+      <td><strong>${escLead(l.nombre)||'—'}</strong></td>
+      <td style="font-size:0.82rem">${contacto}</td>
+      <td>${escLead(l.empresa)||'—'}</td>
+      <td>${escLead(l.tipo_proyecto)||'—'}</td>
+      <td>${l.presupuesto?fmt(l.presupuesto):'—'}</td>
+      <td style="color:${tColor};font-weight:600;white-space:nowrap">${tLabel}</td>
+      <td style="font-size:0.82rem;max-width:280px">${escLead(l.producto)||'—'}${l.notas?`<div style="color:#7f8c8d;margin-top:3px">📝 ${escLead(l.notas)}</div>`:''}</td>
+      <td>${estadoSel}</td>
+      <td>${currentUser.role==='admin'?`<button class="btn btn-danger btn-sm" onclick="deleteLead('${l.id}')">🗑</button>`:'—'}</td>
+    </tr>`;
+  }).join('');
+}
+async function setLeadEstado(id, estado){
+  const l=DB.leads.find(x=>x.id===id); if(l) l.estado=estado;
+  try{ await api('PUT','/leads/'+id,{estado}); }catch(e){ alert('No se pudo actualizar el estado: '+e.message); }
+}
+async function deleteLead(id){
+  if(!confirm('¿Eliminar este lead?')) return;
+  await api('DELETE','/leads/'+id);
+  DB.leads=DB.leads.filter(x=>x.id!==id);
+  renderLeads();
 }
 
 // ===================== GASTOS =====================

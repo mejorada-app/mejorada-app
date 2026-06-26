@@ -73,6 +73,26 @@ db.exec(`
 `);
 db.prepare('INSERT OR IGNORE INTO apikey (id, provider, token_limit, tokens_used) VALUES (1, ?, ?, 0)').run('gemini', 1000000);
 
+// Tabla de Leads (los que llegan de n8n/Odoo, e independiente de Odoo a futuro)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS leads (
+    id TEXT PRIMARY KEY,
+    odoo_lead_id TEXT,
+    nombre TEXT,
+    empresa TEXT,
+    telefono TEXT,
+    correo TEXT,
+    tipo_proyecto TEXT,
+    presupuesto REAL DEFAULT 0,
+    producto TEXT,
+    temperatura TEXT,
+    canal TEXT DEFAULT 'WhatsApp',
+    estado TEXT DEFAULT 'nuevo',
+    notas TEXT,
+    createdAt TEXT DEFAULT (datetime('now'))
+  );
+`);
+
 // Insertar usuarios por defecto si no existen
 const adminExists = db.prepare('SELECT key FROM users WHERE key = ?').get('admin');
 if (!adminExists) {
@@ -135,6 +155,30 @@ function apiStatus() {
   };
 }
 
+// Detecta errores temporales de Google (saturación/cuota) que conviene reintentar
+function isTransientAIError(err){
+  const code = err && (err.status || err.code);
+  const msg = String((err && err.message) || '').toLowerCase();
+  return code === 503 || code === 429 ||
+    /unavailable|overloaded|high demand|resource_exhausted|please try again|\b503\b|\b429\b/.test(msg);
+}
+// Reintenta la llamada con espera creciente (1.2s, 2.4s, 4.8s) si Google está saturado
+async function generateWithRetry(genai, params, retries = 3, baseDelay = 1200){
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++){
+    try { return await genai.models.generateContent(params); }
+    catch (err) {
+      lastErr = err;
+      if (attempt < retries && isTransientAIError(err)) {
+        await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 app.post('/api/extract-factura', async (req, res) => {
   const row = getApiRow();
   const apiKey = currentApiKey();
@@ -154,7 +198,7 @@ app.post('/api/extract-factura', async (req, res) => {
 
   try {
     const genai = new GoogleGenAI({ apiKey });
-    const response = await genai.models.generateContent({
+    const response = await generateWithRetry(genai, {
       model: EXTRACT_MODEL,
       contents: [
         { inlineData: { mimeType: mediaType, data: dataBase64 } },
@@ -187,6 +231,9 @@ app.post('/api/extract-factura', async (req, res) => {
     });
   } catch (err) {
     console.error('extract-factura error:', err.status || '', err.message || err);
+    if (isTransientAIError(err)) {
+      return res.status(503).json({ error: 'El servicio de IA (Google) está saturado en este momento. Ya reintenté varias veces; vuelve a intentar en unos segundos.' });
+    }
     res.status(502).json({ error: 'No se pudo procesar la factura con IA: ' + (err.message || 'error desconocido') });
   }
 });
@@ -223,6 +270,70 @@ app.post('/api/apikey', (req, res) => {
 app.post('/api/apikey/reset', (req, res) => {
   db.prepare("UPDATE apikey SET tokens_used = 0, updated_at = datetime('now') WHERE id = 1").run();
   res.json(Object.assign({ ok: true }, apiStatus()));
+});
+
+// =================== LEADS (entrada desde n8n + gestión en la app) ===================
+// Token opcional: si LEADS_TOKEN está configurado en el entorno, se exige en el header x-leads-token.
+function checkLeadsToken(req, res) {
+  const required = process.env.LEADS_TOKEN;
+  if (!required) return true; // sin token configurado → endpoint abierto (se recomienda configurarlo)
+  if ((req.get('x-leads-token') || '') !== required) {
+    res.status(401).json({ error: 'Token inválido o ausente (header x-leads-token).' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/api/leads', (req, res) => {
+  res.json(db.prepare('SELECT * FROM leads ORDER BY createdAt DESC').all());
+});
+
+app.post('/api/leads', (req, res) => {
+  if (!checkLeadsToken(req, res)) return;
+  const b = req.body || {};
+  const lead = {
+    odoo_lead_id: String(b.odoo_lead_id || ''),
+    nombre: String(b.nombre || b.x_name || '').trim(),
+    empresa: String(b.empresa || '').trim(),
+    telefono: String(b.telefono || '').trim(),
+    correo: String(b.correo || '').trim(),
+    tipo_proyecto: String(b.tipo_proyecto || '').trim(),
+    presupuesto: Number(b.presupuesto) || 0,
+    producto: String(b.producto || '').trim(),
+    temperatura: String(b.temperatura || '').trim(),
+    canal: String(b.canal || 'WhatsApp').trim()
+  };
+  if (!lead.nombre && !lead.telefono && !lead.correo) {
+    return res.status(400).json({ error: 'Lead sin datos mínimos (nombre, teléfono o correo).' });
+  }
+  // Dedup por odoo_lead_id (mientras Odoo y la app coexisten)
+  const existing = lead.odoo_lead_id
+    ? db.prepare('SELECT id FROM leads WHERE odoo_lead_id = ?').get(lead.odoo_lead_id)
+    : null;
+  if (existing) {
+    db.prepare(`UPDATE leads SET nombre=?, empresa=?, telefono=?, correo=?, tipo_proyecto=?, presupuesto=?, producto=?, temperatura=?, canal=? WHERE id=?`)
+      .run(lead.nombre, lead.empresa, lead.telefono, lead.correo, lead.tipo_proyecto, lead.presupuesto, lead.producto, lead.temperatura, lead.canal, existing.id);
+    return res.json({ ok: true, updated: true, id: existing.id });
+  }
+  const id = lead.odoo_lead_id ? ('odoo-' + lead.odoo_lead_id)
+    : ('lead-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  db.prepare(`INSERT INTO leads (id, odoo_lead_id, nombre, empresa, telefono, correo, tipo_proyecto, presupuesto, producto, temperatura, canal, estado) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'nuevo')`)
+    .run(id, lead.odoo_lead_id, lead.nombre, lead.empresa, lead.telefono, lead.correo, lead.tipo_proyecto, lead.presupuesto, lead.producto, lead.temperatura, lead.canal);
+  res.json({ ok: true, created: true, id });
+});
+
+app.put('/api/leads/:id', (req, res) => {
+  const b = req.body || {};
+  const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead no encontrado' });
+  if (b.estado != null) db.prepare('UPDATE leads SET estado = ? WHERE id = ?').run(String(b.estado), req.params.id);
+  if (b.notas != null) db.prepare('UPDATE leads SET notas = ? WHERE id = ?').run(String(b.notas), req.params.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/leads/:id', (req, res) => {
+  db.prepare('DELETE FROM leads WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
 });
 
 // =================== USERS ===================
